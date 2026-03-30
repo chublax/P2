@@ -11,14 +11,16 @@ function main1()
     FFF(2) = 0;                   % Pause flag: 1 = paused, 0 = running
 
     LastDepth = [];               % Stores latest depth image
-    currGyroAtt = zeros(3,1);
+    currPredAttAtLastDepth = zeros(3,1);
+    currAltCm = 0;
+    currEAtt = zeros(3,1);
     Main2();
     return;
 
 %======================================================================
 function Main2()
 % Load dataset
-s = 'dataSets/HH03/';
+s = 'dataSets/HH04/';
 [ok, info] = Api.LoadDataSet(s);
 if (ok < 0), return; end
     disp(info);
@@ -60,20 +62,25 @@ if (ok < 0), return; end
     set(hhO3(3), 'LineWidth', 3);
 
 %%======================== Part B ================================
-    % Attitude scope     3 channel, figure 27, show last 500, samples, y axis from -180 to 180 deg
+    % Attitude scope
     [okAtt, hhAtt] = Api.IniScopesNChannels(3, 27, 500, [-180,180], 'Estimated Attitude (RPY)', {'Roll (deg)', 'Pitch (deg)', 'Yaw (deg)'} );
-    cAttx = 1; % initial write position
-    if (okAtt < 1), return; end % stop scope if faled to create
+    cAttx = 1;
+    if (okAtt < 1), return; end
 
-    set(hhAtt(1), 'LineWidth', 2); 
+    set(hhAtt(1), 'LineWidth', 2);
     set(hhAtt(2), 'LineWidth', 2);
     set(hhAtt(3), 'LineWidth', 2);
 
     % Attitude estimator state
-    currAtt = zeros(3,1);         % radians
+    currAtt = zeros(3,1);         % radians, IMU prediction state
     currGyroBias = zeros(3,1);    % rad/s
     tPrevSec = [];                % previous timestamp in seconds
     tb = 4;                       % bias estimation window (seconds)
+    resetPredAttit();
+
+    currPredAttAtLastDepth = zeros(3,1);   % predicted attitude linked to latest depth frame
+    currAltCm = 0;                % latest floor altitude estimate in cm
+    currEAtt  = zeros(3,1);       % [roll; pitch; yaw] from plane geometry, rad
 
     %% Image displays (RGB and depth)
         figure(21); clf();
@@ -128,9 +135,6 @@ if (ok < 0), return; end
         grid on;
         rotate3d on;
 
-        currAltCm = 0;   % latest altitude estimate in cm
-        currEAtt = zeros(3,1);   % [roll; pitch; yaw] in rad used by Part E
-
         %% Playback controls
         t0 = 0;
         hh = MkMenuInFigure(21);
@@ -172,26 +176,21 @@ if (ok < 0), return; end
                     gyros = r.Data(4:6) * k;   % deg/s
                     mag   = r.Data(7:9);       % magnetometer
 
-                    % Part B: attitude prediction using gyro in rad/s
-                    tSec = double(r.t) * 0.0001; % (convert to sec,api time unit is 0.1s so * 0.0001)
+                    tSec = double(r.t) * 0.0001;
 
-                    if isempty(tPrevSec) % No timestamp, first imu sample, store current time and wait for next sample
+                    if isempty(tPrevSec)
                         tPrevSec = tSec;
                     else
-                        dt = tSec - tPrevSec; % (time difference between current and previous sample)
-                        tPrevSec = tSec; % update current time
+                        dt = tSec - tPrevSec;
+                        tPrevSec = tSec;
 
-                        gyroRad = r.Data(4:6);  % get gyro data in rad/s
+                        gyroRad = r.Data(4:6);   % rad/s
                         [currGyroBias, currAtt] = predAttit(currAtt, gyroRad, dt, tSec, tb, currGyroBias);
-                        
-                        currGyroAtt = currAtt;
 
-
-                        rpyDeg = currAtt * (180/pi); % Convert roll, pitch, yaw from radians into degrees for plotting
-                        cAttx = Api.PushDataInScopeChannels(hhAtt, cAttx, rpyDeg); % Push the new attitude sample into the attitude scope.
+                        rpyDeg = currAtt * (180/pi);
+                        cAttx = Api.PushDataInScopeChannels(hhAtt, cAttx, rpyDeg);
                     end
 
-                    % Update IMU scopes
                     cO1x = Api.PushDataInScopeChannels(hhO1, cO1x, gyros);
                     cO2x = Api.PushDataInScopeChannels(hhO2, cO2x, accel);
                     cO3x = Api.PushDataInScopeChannels(hhO3, cO3x, mag);
@@ -215,13 +214,13 @@ if (ok < 0), return; end
                     hpoints.ZData = zz;
 
                     LastDepth = r.Data;
-                    
+                    currPredAttAtLastDepth = currAtt;
+
                     % DEBUG: confirm values are reaching case 2
                     if(mod(SamplesCounts(2), 30) == 0)
                         fprintf('DEBUG case2: currAltCm=%.2f, currEAtt=[%.4f %.4f %.4f]\n', ...
                         currAltCm, currEAtt(1), currEAtt(2), currEAtt(3));
                     end
-
 
                     % Part E: compensate full point cloud using latest ROI estimates
                     ptsCam  = [xx(:), yy(:), zz(:)];
@@ -259,15 +258,14 @@ if (ok < 0), return; end
                     ec = 0;
 
                     currAtt = zeros(3,1);
-                    currGyroAtt = zeros(3,1);
                     currGyroBias = zeros(3,1);
                     tPrevSec = [];
                     currAltCm = 0;
                     currEAtt = zeros(3,1);
+                    currPredAttAtLastDepth = zeros(3,1);
+                    resetPredAttit();
 
-                    clear predAttit;
-
-    continue;
+                    continue;
 
                 %==========================================================
                 case 255   % End of dataset
@@ -343,7 +341,7 @@ if (ok < 0), return; end
             return;
         end
 
-        ptsCam = [xx(:), yy(:), zz(:)];   % mm, camera CF % flattens the ROI point matrices into an N x 3 list of points in the camera coordinate frame.
+        ptsCam = [xx(:), yy(:), zz(:)];   % mm, camera CF
 
         % Show ROI points
         figure(25); clf();
@@ -374,21 +372,21 @@ if (ok < 0), return; end
         currEAtt  = [rpa(1); rpa(2); 0] * pi/180;
         fprintf('DEBUG ROI: currAltCm=%.2f cm, currEAtt=[%.4f %.4f %.4f] rad\n', ...
         currAltCm, currEAtt(1), currEAtt(2), currEAtt(3));
-        
+
         % --- Project 2: Plane Association ---
-surfNames = {'no match', 'floor', 'wall1', 'door', 'wall2', 'ceiling'};
-surfID = InferWhichWall(nHat, currGyroAtt, 15);   % currAtt is your gyro attitude in rad
-fprintf('Plane association result: %s (ID = %d)\n', surfNames{surfID + 1}, surfID);
+        surfNames = {'no match', 'floor', 'wall1', 'door', 'wall2', 'ceiling'};
+        surfID = InferWhichWall(nHat, currPredAttAtLastDepth, 15);
+        fprintf('Plane association result: %s (ID = %d)\n', surfNames{surfID + 1}, surfID);
 
-msg = sprintf(['Selected region is a plane with normal vector [%.4f %.4f %.4f], ' ...
-               'roll = %.2f deg, pitch = %.2f deg, altitude = %.2f cm. ' ...
-               'Association: %s (ID=%d)'], ...
-               nHat(1), nHat(2), nHat(3), rpa(1), rpa(2), rpa(3), ...
-               surfNames{surfID + 1}, surfID);
+        msg = sprintf(['Selected region is a plane with normal vector [%.4f %.4f %.4f], ' ...
+                       'roll = %.2f deg, pitch = %.2f deg, altitude = %.2f cm. ' ...
+                       'Association: %s (ID=%d)'], ...
+                       nHat(1), nHat(2), nHat(3), rpa(1), rpa(2), rpa(3), ...
+                       surfNames{surfID + 1}, surfID);
 
-disp(msg);
-title(msg);
-return;
+        disp(msg);
+        title(msg);
+        return;
     end
 
     %======================================================================
@@ -431,19 +429,7 @@ end
 
 %============================ PART A
 
-%Plot3DFiltered
-% Func for Part A Task 2
-
-
 function plot3DFiltered(nearThresh, farThresh, Depth, scaHanNear, scaHanFar)
-% plot3DFiltered
-% Filters and visualises 3D points based on distance from the camera.
-% Inputs:
-%   nearThresh: [dmin dmax] in meters, default [0.1 1.2]
-%   farThresh : [dmin dmax] in meters, default [1.2 2.0]
-%   Depth     : N x 3 points in millimeters, camera frame
-%   scaHanNear: scatter handle for near points
-%   scaHanFar : scatter handle for far points
 
     if nargin < 1 || isempty(nearThresh)
         nearThresh = [0.1 1.2];
@@ -464,7 +450,6 @@ function plot3DFiltered(nearThresh, farThresh, Depth, scaHanNear, scaHanFar)
     Xm = X * 0.001;
     Ym = Y * 0.001;
     Zm = Z * 0.001;
-%euclidean norm 
     d = sqrt(Xm.^2 + Ym.^2 + Zm.^2);
 
     valid = (d >= 0.1) & (d <= 2.0);
@@ -483,25 +468,35 @@ end
 
 %====================== PART B
 
-%preAttit
+function resetPredAttit()
+    clear predAttit
+end
 
+function ang = wrapToPiLocal(ang)
+    ang = mod(ang + pi, 2*pi) - pi;
+end
 
+function R = rpyRotationMatrix(att)
+    r = att(1);
+    p = att(2);
+    y = att(3);
+
+    Rx = [1 0 0;
+          0 cos(r) -sin(r);
+          0 sin(r)  cos(r)];
+
+    Ry = [ cos(p) 0 sin(p);
+              0   1   0;
+          -sin(p) 0 cos(p)];
+
+    Rz = [cos(y) -sin(y) 0;
+          sin(y)  cos(y) 0;
+             0       0   1];
+
+    R = Rz * Ry * Rx;
+end
 
 function [currGyroBias, currAtt] = predAttit(currAtt, gyro, dt, t, tb, currGyroBias)
-% predAttit
-% Simple attitude prediction from gyros with initial bias estimation.
-%
-% Inputs
-%   currAtt       3x1 attitude [roll; pitch; yaw] in radians
-%   gyro          3x1 angular velocity [wx; wy; wz] in rad/s
-%   dt            timestep in seconds
-%   t             current time in seconds
-%   tb            bias estimation duration in seconds (default 4)
-%   currGyroBias  3x1 gyro bias estimate in rad/s
-%
-% Outputs
-%   currGyroBias  updated bias (running mean during first tb seconds)
-%   currAtt       updated attitude in radians
 
     if nargin < 5 || isempty(tb)
         tb = 4;
@@ -526,75 +521,67 @@ function [currGyroBias, currAtt] = predAttit(currAtt, gyro, dt, t, tb, currGyroB
     end
 
     if ~printed
-        fprintf('Gyro bias estimated at t=%.3f s: [%.6f %.6f %.6f] rad/s\n', t, currGyroBias(1), currGyroBias(2), currGyroBias(3));
+        fprintf('Gyro bias estimated at t=%.3f s: [%.6f %.6f %.6f] rad/s\n', ...
+            t, currGyroBias(1), currGyroBias(2), currGyroBias(3));
         printed = true;
     end
 
     gyroCorr = gyro(:) - currGyroBias(:);
 
-    % Euler integration of angular rates to angles (basic dead reckoning)
-    currAtt = currAtt + gyroCorr * dt;
+    phi = currAtt(1);
+    th  = currAtt(2);
 
-    % Optional wrapping for nicer plots
-    currAtt = mod(currAtt + pi, 2*pi) - pi;
+    sphi = sin(phi);
+    cphi = cos(phi);
+    cth  = cos(th);
+
+    if abs(cth) < 1e-6
+        cth = sign(cth + eps) * 1e-6;
+    end
+
+    phiDot = gyroCorr(1) + sphi * tan(th) * gyroCorr(2) + cphi * tan(th) * gyroCorr(3);
+    thDot  = cphi * gyroCorr(2) - sphi * gyroCorr(3);
+    psiDot = (sphi / cth) * gyroCorr(2) + (cphi / cth) * gyroCorr(3);
+
+    currAtt = currAtt + dt * [phiDot; thDot; psiDot];
+
+    currAtt(1) = wrapToPiLocal(currAtt(1));
+    currAtt(2) = wrapToPiLocal(currAtt(2));
+    currAtt(3) = wrapToPiLocal(currAtt(3));
 end
-
 
 % ============================== PART C
 
-% compensateCamera
-% Func for Part C 2b
-
-function ptsPlat=compensateCamera(ptsCF,att)
-% Convert points from camera CF to platform CF using attitude offset.
-% ptsCF: Nx3 points in mm, camera CF
-% att : [roll pitch yaw] in degrees. Default is [0,20,0].
+function ptsPlat = compensateCamera(ptsCF, att)
 
     if (nargin<2 || isempty(att)), att=[0,20,0]; end
     if (isempty(ptsCF)), ptsPlat=ptsCF; return ; end
 
-    r=att(1)*pi/180;
-    p=att(2)*pi/180;
-    y=att(3)*pi/180;
+    attRad = att(:).' * pi/180;
+    R = rpyRotationMatrix(attRad);
 
-    Rx=[1 0 0; 0 cos(r) -sin(r); 0 sin(r) cos(r)];
-    Ry=[cos(p) 0 sin(p); 0 1 0; -sin(p) 0 cos(p)];
-    Rz=[cos(y) -sin(y) 0; sin(y) cos(y) 0; 0 0 1];
-
-    R=Rz*Ry*Rx;
-
-    ptsPlat=(R*ptsCF.').';
+    ptsPlat = (R * ptsCF.').';
     return ;
 end
 
-%checkisPlane
-function isPlane=checkIsPlane(ROIpts,tol)
-% Check if ROI points belong to a plane within tolerance.
-% ROIpts: Nx3 points in mm, platform CF
-% tol  : tolerance in mm, default 20
+function isPlane = checkIsPlane(ROIpts, tol)
 
     if (nargin<2 || isempty(tol)), tol=20; end
-    if (isempty(ROIpts) || size(ROIpts,1)<3), isPlane=0; return ; end % error check 3 points or empty 
+    if (isempty(ROIpts) || size(ROIpts,1)<3), isPlane=0; return ; end
 
-    [nHat,centroid]=estimatePlaneNorm(ROIpts); 
+    ROIpts = ROIpts(all(isfinite(ROIpts),2), :);
+    if (size(ROIpts,1)<3), isPlane=0; return ; end
 
-    dif=ROIpts-centroid.'; % difference between points 
-    dist=abs(dif*nHat);   % mm, because nHat is unit and dif is mm (difference perp dist to plane)
+    [nHat, centroid] = estimatePlaneNorm(ROIpts);
 
-    isPlane=all(dist<=tol);
+    dif = ROIpts - centroid.';
+    dist = abs(dif * nHat);
+
+    isPlane = all(dist <= tol);
     return ;
 end
 
-
-%estimatePlaneNorm
-
-% Func for Part C
-%3d points to 
-function [normPlane,centroid]=estimatePlaneNorm(ROIpts)
-% Estimate a best fit plane normal and centroid of points using SVD.
-% ROIpts: Nx3 points in mm, platform CF
-% normPlane: 3x1 unit normal
-% centroid : 3x1 point on plane (mean of points)
+function [normPlane, centroid] = estimatePlaneNorm(ROIpts)
 
     if (isempty(ROIpts))
         normPlane=[0;0;1];
@@ -602,59 +589,54 @@ function [normPlane,centroid]=estimatePlaneNorm(ROIpts)
         return ;
     end
 
-    % Compute centroid
-    centroid=mean(ROIpts,1).';
-    Q=ROIpts-centroid.';
+    ROIpts = ROIpts(all(isfinite(ROIpts),2), :);
+    if isempty(ROIpts)
+        normPlane=[0;0;1];
+        centroid=[0;0;0];
+        return ;
+    end
 
-    [~,~,V]=svd(Q,0);
-    n=V(:,3);
+    centroid = mean(ROIpts,1).';
+    Q = ROIpts - centroid.';
 
-    n=n/norm(n);
+    [~,~,V] = svd(Q,0);
+    n = V(:,3);
 
-% enforce consistent direction: normal should point toward camera
-% camera optical axis in platform CF (after 20 deg pitch down compensation)
-camDir = [sin(20*pi/180); 0; cos(20*pi/180)];  % approx [0.34; 0; 0.94]
-if dot(n, camDir) < 0
-    n = -n;
-end
+    if norm(n) < 1e-12
+        normPlane = [0;0;1];
+        return ;
+    end
 
-    normPlane=n;
+    n = n / norm(n);
+
+    % enforce a consistent direction: prefer positive z
+    if (n(3)<0), n=-n; end
+
+    normPlane = n;
     return ;
 end
 
+function rollPitchAlt = estimateRollPitchAltitude(normPlane, centroid)
 
-%estimateRollpitchAltitude
+    n = normPlane(:);
+    n = n / norm(n);
+    if (n(3)<0), n=-n; end
 
-% Func for Part C
+    nx = n(1); ny = n(2); nz = n(3);
 
-function rollPitchAlt=estimateRollPitchAltitude(normPlane,centroid)
-% Estimate roll, pitch (deg) and altitude (cm) from plane normal and centroid.
-% normPlane: 3x1 unit normal in platform CF
-% centroid : 3x1 point on plane (mm)
-% output   : [roll pitch altitude] -> deg, deg, cm
+    roll  = atan2(ny, nz) * 180/pi;
+    pitch = atan2(-nx, sqrt(ny^2 + nz^2)) * 180/pi;
 
-    n=normPlane(:);
-    n=n/norm(n);
+    h_mm = abs(dot(n, centroid(:)));
+    h_cm = h_mm/10;
 
-    nx=n(1); ny=n(2); nz=n(3);
-
-    roll = atan2(ny,nz)*180/pi;
-    pitch= atan2(-nx,nz)*180/pi;
-
-    h_mm=abs(dot(n,centroid(:)));
-    h_cm=h_mm/10;
-
-    rollPitchAlt=[roll,pitch,h_cm];
+    rollPitchAlt = [roll, pitch, h_cm];
     return ;
 end
 
 % ============================== PART D
 
-function rollPitch=estimateRollPitchCost(ptsCF,initRP)
-% Estimate roll and pitch by minimizing a least-squares cost derived from floor-plane constraint.
-% ptsCF  : Nx3 points on planar floor, expressed in platform CF (mm)
-% initRP : [phi0 theta0] initial guess in radian (use [0,0])
-% output : [roll pitch] in degree
+function rollPitch = estimateRollPitchCost(ptsCF, initRP)
 
     if (nargin<2 || isempty(initRP)), initRP=[0,0]; end
     if (isempty(ptsCF) || size(ptsCF,1)<10)
@@ -663,7 +645,6 @@ function rollPitch=estimateRollPitchCost(ptsCF,initRP)
         return ;
     end
 
-    % make sure it is Nx3
     if (size(ptsCF,2)~=3)
         ptsCF=ptsCF.';
         if (size(ptsCF,2)~=3)
@@ -673,7 +654,6 @@ function rollPitch=estimateRollPitchCost(ptsCF,initRP)
         end
     end
 
-    % use fminsearch to minimize scalar cost
     opt=optimset('Display','off','TolX',1e-6,'TolFun',1e-6,'MaxIter',200);
 
     x=fminsearch(@(u)CostFun(u,ptsCF), initRP(:).', opt);
@@ -681,65 +661,32 @@ function rollPitch=estimateRollPitchCost(ptsCF,initRP)
     rollPitch = x*180/pi;
     return ;
 
+    function J = CostFun(u,P)
+        phi = u(1);
+        th  = u(2);
 
-    %-------------------------------------------------
-    function J=CostFun(u,P)
-        % u=[phi theta] in rad
-        phi=u(1);
-        th =u(2);
+        R = rpyRotationMatrix([phi, th, 0]);
 
-        c1=cos(phi); s1=sin(phi);
-        c2=cos(th ); s2=sin(th );
+        Q = P - mean(P,1);
+        Qr = (R.' * Q.').';
 
-        % roll about x, pitch about y
-        Rx=[1 0 0; 0 c1 -s1; 0 s1 c1];
-        Ry=[c2 0 s2; 0 1 0; -s2 0 c2];
-
-        R=Ry*Rx;
-
-        % remove translation (important). we only care about plane orientation, not altitude.
-        Q=P-mean(P,1);
-
-        % rotate demeaned points
-        Qr=(R*Q.').';
-
-        % floor constraint: after correct roll/pitch, all z should be ~0
-        z=Qr(:,3);
-        J=sum(z.^2);
-
+        z = Qr(:,3);
+        J = sum(z.^2);
     end
-
 end
 
 % ============================== PART E
 
-
-%plotCompensatedCloud
-function ptsTrans=plotCompensatedCloud(ptsCF,att,altitude)
-% Transform point cloud using attitude (rad) and altitude (cm).
-% ptsCF    : Nx3 points in platform CF (mm)
-% att      : [roll pitch yaw] in rad
-% altitude : scalar in cm
-% ptsTrans : Nx3 transformed points (mm)
+function ptsTrans = plotCompensatedCloud(ptsCF, att, altitude)
 
     if (isempty(ptsCF)), ptsTrans=ptsCF; return ; end
     if (nargin<2 || isempty(att)), att=[0,0,0]; end
     if (nargin<3 || isempty(altitude)), altitude=0; end
 
-    r=att(1); p=att(2); y=att(3);
-
-    cr=cos(r); sr=sin(r);
-    cp=cos(p); sp=sin(p);
-    cy=cos(y); sy=sin(y);
-
-    Rx=[1 0 0; 0 cr -sr; 0 sr cr];
-    Ry=[cp 0 sp; 0 1 0; -sp 0 cp];
-    Rz=[cy -sy 0; sy cy 0; 0 0 1];
-
-    R=Rz*Ry*Rx;
+    R = rpyRotationMatrix(att(:).');
 
     % rotate to global (use inverse so we compensate the platform attitude)
-    ptsTrans=(R.'*ptsCF.').';
+    ptsTrans = (R.' * ptsCF.').';
 
     % apply vertical translation using altitude (cm -> mm)
     ptsTrans(:,3) = ptsTrans(:,3) - altitude*10;
@@ -747,74 +694,55 @@ function ptsTrans=plotCompensatedCloud(ptsCF,att,altitude)
     return ;
 end
 
-
 %============= proj 2
 
 function ThisOne = InferWhichWall(nPlatform, attRad, tolDeg)
-% InferWhichWall
-% Associates a detected flat patch normal vector with a known surface in GCF.
-%
-% Inputs:
-%   nPlatform : 3x1 unit normal vector of the flat patch, in platform CF
-%   attRad    : [roll; pitch; yaw] current attitude estimate in radians
-%   tolDeg    : angular tolerance in degrees (recommended: 15)
-%
-% Output:
-%   ThisOne   : 0 = no match
-%               1 = floor  (GCF normal [0;0;+1])
-%               2 = wall1  (GCF normal [-1;0;0])
-%               3 = door   (GCF normal [0;+1;0])
-%               4 = wall2  (GCF normal [0;-1;0])
-%               5 = ceil   (GCF normal [0;0;-1])
 
     if nargin < 3 || isempty(tolDeg), tolDeg = 15; end
+    if isempty(nPlatform) || norm(nPlatform) < 1e-12
+        ThisOne = 0;
+        return;
+    end
 
-    % Known surface normals in GCF (each row is one surface)
     knownNormals = [ 0,  0, +1;   % 1: floor
                     -1,  0,  0;   % 2: wall1
                      0, +1,  0;   % 3: door
                      0, -1,  0;   % 4: wall2
                      0,  0, -1];  % 5: ceiling
 
-    % Build rotation matrix: platform CF -> GCF
-    % Uses same Rx*Ry*Rz convention as your existing functions
-    r = attRad(1); p = attRad(2); y = attRad(3);
+    R = rpyRotationMatrix(attRad(:).');   % platform -> global
 
-    cr = cos(r); sr = sin(r);
-    cp = cos(p); sp = sin(p);
-    cy = cos(y); sy = sin(y);
-
-    Rx = [1,  0,   0;
-          0,  cr, -sr;
-          0,  sr,  cr];
-
-    Ry = [ cp, 0, sp;
-            0, 1,  0;
-          -sp, 0, cp];
-
-    Rz = [cy, -sy, 0;
-          sy,  cy, 0;
-           0,   0, 1];
-
-    R = Rz * Ry * Rx;   % platform -> global
-
-    % Rotate the detected patch normal into GCF
-    n = R * nPlatform(:);
-    n = n / norm(n);   % ensure unit length
+    nPlatform = nPlatform(:) / norm(nPlatform(:));
+    cand1 = R * nPlatform;
+    cand2 = -cand1;
 
     tolRad = tolDeg * pi / 180;
-    ThisOne = 0;   % default: no match
+    ThisOne = 0;
+    bestAng = inf;
+    bestID = 0;
 
-    for i = 1:5
-        nRef = knownNormals(i, :)';
-        % Angle between two unit vectors via dot product
-        cosAng = dot(n, nRef);
-        cosAng = max(-1, min(1, cosAng));   % clamp for numerical safety
-        ang = acos(cosAng);
-        if ang <= tolRad
-            ThisOne = i;
-            return;
+    for c = 1:2
+        if c == 1
+            n = cand1;
+        else
+            n = cand2;
+        end
+
+        for i = 1:5
+            nRef = knownNormals(i, :)';
+            cosAng = dot(n, nRef);
+            cosAng = max(-1, min(1, cosAng));
+            ang = acos(cosAng);
+
+            if ang < bestAng
+                bestAng = ang;
+                bestID = i;
+            end
         end
     end
+
+    if bestAng <= tolRad
+        ThisOne = bestID;
+    end
 end
-% END OF FILE 
+% END OF FILE
